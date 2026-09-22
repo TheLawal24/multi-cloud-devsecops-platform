@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: multi-cloud-capstone-gcp
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/TheLawal24/multi-cloud-devsecops-platform.git
+    targetRevision: main
+    path: kubernetes/base
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: multi-cloud-capstone
+
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+    syncOptions:
+      - CreateNamespace=true
