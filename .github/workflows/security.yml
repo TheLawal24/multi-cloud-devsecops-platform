@@ -66,11 +66,16 @@ jobs:
           python -m pip install checkov
 
       - name: Checkov
+        shell: bash
         run: |
-          checkov \
-            -d terraform \
-            --framework terraform \
-            --soft-fail
+          if find terraform -type f -name '*.tf' -print -quit 2>/dev/null | grep -q .; then
+            checkov \
+              -d terraform \
+              --framework terraform \
+              --soft-fail
+          else
+            echo "No Terraform files yet. Skipping Checkov."
+          fi
 
       - name: Install Trivy
         shell: bash
@@ -95,8 +100,13 @@ jobs:
             app
 
       - name: Trivy Terraform scan
+        shell: bash
         run: |
-          trivy config \
-            --severity HIGH,CRITICAL \
-            --exit-code 0 \
-            terraform
+          if find terraform -type f -name '*.tf' -print -quit 2>/dev/null | grep -q .; then
+            trivy config \
+              --severity HIGH,CRITICAL \
+              --exit-code 0 \
+              terraform
+          else
+            echo "No Terraform files yet. Skipping Trivy Terraform scan."
+          fi
