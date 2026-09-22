@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: europe-west2-docker.pkg.dev/lawal-project-84096/kubernetes-gitops-platform/multi-cloud-devsecops-platform:6b334b0
+image: europe-west2-docker.pkg.dev/lawal-project-84096/kubernetes-gitops-platform/multi-cloud-devsecops-platform:1359aa63dec91141b8a938ac4f9ef9b7ac8adff3
           ports:
             - containerPort: 8080
           env:
