@@ -1,0 +1,25 @@
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+.terraform.lock.hcl
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Security reports
+security-reports/
+
+# Environment/secrets
+.env
+*.pem
+*.key
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
