@@ -1,0 +1,324 @@
+name: Multi-Cloud Deploy
+
+on:
+  workflow_run:
+    workflows:
+      - Security CI
+    types:
+      - completed
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  deploy:
+    name: Build Once and Deploy to GCP + AWS
+
+    if: >
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_branch == 'main'
+
+    runs-on: ubuntu-latest
+
+    env:
+      APP_SHA: ${{ github.event.workflow_run.head_sha }}
+      APP_NAME: multi-cloud-devsecops-platform
+
+    steps:
+      - name: Checkout validated source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Show deployment version
+        run: |
+          echo "Deploying commit: ${APP_SHA}"
+
+      # ---------------------------------------------------------
+      # BUILD ONCE
+      # ---------------------------------------------------------
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build immutable application image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            --load \
+            -t "${APP_NAME}:${APP_SHA}" \
+            ./app
+
+          docker image inspect "${APP_NAME}:${APP_SHA}" >/dev/null
+
+      # ---------------------------------------------------------
+      # GCP OIDC + ARTIFACT REGISTRY
+      # ---------------------------------------------------------
+      - name: Authenticate to GCP with OIDC
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_IMAGE_PUBLISH_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure GAR authentication
+        run: |
+          gcloud auth configure-docker \
+            "${{ vars.GAR_LOCATION }}-docker.pkg.dev" \
+            --quiet
+
+      - name: Push immutable image to GCP Artifact Registry
+        env:
+          GCP_IMAGE: ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/multi-cloud-devsecops-platform
+        run: |
+          docker tag \
+            "${APP_NAME}:${APP_SHA}" \
+            "${GCP_IMAGE}:${APP_SHA}"
+
+          docker push "${GCP_IMAGE}:${APP_SHA}"
+
+          echo "GCP image: ${GCP_IMAGE}:${APP_SHA}"
+
+      # ---------------------------------------------------------
+      # AWS OIDC + ECR
+      # ---------------------------------------------------------
+      - name: Authenticate to AWS with OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push same immutable image to Amazon ECR
+        env:
+          AWS_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          AWS_IMAGE="${AWS_REGISTRY}/${{ vars.AWS_ECR_REPOSITORY }}:${APP_SHA}"
+
+          if aws ecr describe-images \
+            --repository-name "${{ vars.AWS_ECR_REPOSITORY }}" \
+            --image-ids imageTag="${APP_SHA}" \
+            --region "${{ vars.AWS_REGION }}" \
+            >/dev/null 2>&1; then
+
+            echo "AWS image ${APP_SHA} already exists. Reusing immutable image."
+          else
+            docker tag \
+              "${APP_NAME}:${APP_SHA}" \
+              "${AWS_IMAGE}"
+
+            docker push "${AWS_IMAGE}"
+          fi
+
+          echo "AWS image: ${AWS_IMAGE}"
+
+      # ---------------------------------------------------------
+      # AWS ECS DEPLOYMENT
+      # ---------------------------------------------------------
+      - name: Register new ECS task definition
+        id: ecs-task
+        env:
+          AWS_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          AWS_IMAGE="${AWS_REGISTRY}/${{ vars.AWS_ECR_REPOSITORY }}:${APP_SHA}"
+
+          aws ecs describe-task-definition \
+            --task-definition multi-cloud-capstone \
+            --region "${{ vars.AWS_REGION }}" \
+            --query taskDefinition \
+            > /tmp/current-task-definition.json
+
+          jq \
+            --arg IMAGE "${AWS_IMAGE}" \
+            --arg VERSION "${APP_SHA}" \
+            '
+            .containerDefinitions[0].image = $IMAGE
+            |
+            .containerDefinitions[0].environment =
+              (.containerDefinitions[0].environment
+                | map(
+                    if .name == "APP_VERSION"
+                    then .value = $VERSION
+                    else .
+                    end
+                  )
+              )
+            |
+            del(
+              .taskDefinitionArn,
+              .revision,
+              .status,
+              .requiresAttributes,
+              .compatibilities,
+              .registeredAt,
+              .registeredBy
+            )
+            ' \
+            /tmp/current-task-definition.json \
+            > /tmp/new-task-definition.json
+
+          NEW_TASK_DEFINITION=$(aws ecs register-task-definition \
+            --cli-input-json file:///tmp/new-task-definition.json \
+            --region "${{ vars.AWS_REGION }}" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "task_definition=${NEW_TASK_DEFINITION}" >> "$GITHUB_OUTPUT"
+
+          echo "Registered: ${NEW_TASK_DEFINITION}"
+
+      - name: Deploy new revision to AWS ECS
+        run: |
+          aws ecs update-service \
+            --cluster "${{ vars.AWS_ECS_CLUSTER }}" \
+            --service "${{ vars.AWS_ECS_SERVICE }}" \
+            --task-definition "${{ steps.ecs-task.outputs.task_definition }}" \
+            --region "${{ vars.AWS_REGION }}" \
+            >/dev/null
+
+          echo "Waiting for ECS service stability..."
+
+          aws ecs wait services-stable \
+            --cluster "${{ vars.AWS_ECS_CLUSTER }}" \
+            --services "${{ vars.AWS_ECS_SERVICE }}" \
+            --region "${{ vars.AWS_REGION }}"
+
+      - name: Verify AWS application
+        run: |
+          RESPONSE=$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 10 \
+            --retry-delay 5 \
+            "${{ vars.AWS_APPLICATION_URL }}/")
+
+          echo "${RESPONSE}"
+
+          echo "${RESPONSE}" \
+            | jq -e \
+              --arg SHA "${APP_SHA}" \
+              '
+              .status == "healthy"
+              and
+              .cloud == "aws"
+              and
+              .version == $SHA
+              '
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            "${{ vars.AWS_APPLICATION_URL }}/health"
+
+      # ---------------------------------------------------------
+      # GCP GITOPS PROMOTION
+      # ---------------------------------------------------------
+      - name: Update GCP GitOps manifest
+        env:
+          GCP_IMAGE: ${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/multi-cloud-devsecops-platform
+        run: |
+          python3 - <<PY
+          from pathlib import Path
+
+          path = Path("kubernetes/base/deployment.yaml")
+          text = path.read_text()
+
+          lines = text.splitlines()
+
+          changed = False
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if stripped.startswith("image:") and "multi-cloud-devsecops-platform" in stripped:
+                  indent = line[:len(line) - len(line.lstrip())]
+                  lines[i] = f"${indent}image: ${GCP_IMAGE}:${APP_SHA}"
+                  changed = True
+
+          if not changed:
+              raise SystemExit("Capstone image line not found in Kubernetes deployment.")
+
+          path.write_text("\n".join(lines) + "\n")
+
+          print("Updated GCP manifest to ${GCP_IMAGE}:${APP_SHA}")
+          PY
+
+      - name: Commit GCP GitOps promotion
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+          git checkout main
+          git pull --ff-only origin main
+
+          # Reapply the validated SHA after updating to current main.
+          GCP_IMAGE="${{ vars.GAR_LOCATION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/multi-cloud-devsecops-platform"
+
+          python3 - <<PY
+          from pathlib import Path
+
+          path = Path("kubernetes/base/deployment.yaml")
+          lines = path.read_text().splitlines()
+
+          changed = False
+
+          for i, line in enumerate(lines):
+              stripped = line.strip()
+
+              if stripped.startswith("image:") and "multi-cloud-devsecops-platform" in stripped:
+                  indent = line[:len(line) - len(line.lstrip())]
+                  lines[i] = f"${indent}image: ${GCP_IMAGE}:${APP_SHA}"
+                  changed = True
+
+          if not changed:
+              raise SystemExit("Capstone image line not found.")
+
+          path.write_text("\n".join(lines) + "\n")
+          PY
+
+          if git diff --quiet -- kubernetes/base/deployment.yaml; then
+            echo "GCP manifest already references ${APP_SHA}."
+          else
+            git add kubernetes/base/deployment.yaml
+
+            git commit \
+              -m "chore(gitops): deploy ${APP_SHA} to GCP [skip ci]"
+
+            git push origin main
+          fi
+
+      # ---------------------------------------------------------
+      # SUMMARY
+      # ---------------------------------------------------------
+      - name: Deployment summary
+        run: |
+          {
+            echo "## Multi-Cloud Deployment"
+            echo ""
+            echo "**Application SHA:** \`${APP_SHA}\`"
+            echo ""
+            echo "### GCP"
+            echo "- Artifact Registry image pushed"
+            echo "- GitOps manifest updated"
+            echo "- Argo CD will reconcile GKE automatically"
+            echo ""
+            echo "### AWS"
+            echo "- ECR image pushed"
+            echo "- New ECS task definition registered"
+            echo "- ECS service reached stable state"
+            echo "- AWS application health check passed"
+          } >> "$GITHUB_STEP_SUMMARY"
